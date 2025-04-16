@@ -109,8 +109,15 @@ public:
 
         ov::Coordinate start_key{0,0,0,0};
         ov::Coordinate start_value{0,0,0,0};
-
-        if (m_device.find("GPU") == std::string::npos) {// Allocate KV caches
+        auto can_get_context = [&]() {
+            try {
+                auto remote_context = m_request.get_compiled_model().get_context();
+            } catch (const std::exception& ex) {
+                return false;
+            }
+            return true;
+        };
+        if (m_device.find("GPU") == std::string::npos || !can_get_context()) {// Allocate KV caches
             for (size_t decoder_layer_id = 0; decoder_layer_id < m_num_decoder_layers; ++decoder_layer_id) {
                 ov::Shape value_cache_shape = set_kv_blocks(m_value_shapes[decoder_layer_id], num_kv_blocks);
                 ov::Shape key_cache_shape = set_kv_blocks(m_key_shapes[decoder_layer_id], num_kv_blocks);
