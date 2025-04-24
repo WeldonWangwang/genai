@@ -39,7 +39,7 @@ int main(int argc, char* argv[]) try {
     ov::genai::GenerationConfig config;
     config.max_new_tokens = result["max_new_tokens"].as<size_t>();
 
-    ov::genai::LLMPipeline pipe(models_path, device);
+    ov::genai::LLMPipeline pipe(models_path, device, {{"MODEL_DISTRIBUTION_POLICY", "PIPELINE_PARALLEL"}});
 
     for (size_t i = 0; i < num_warmup; i++)
         pipe.generate(prompt, config);
