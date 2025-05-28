@@ -7,6 +7,7 @@
 #include <list>
 
 #include "openvino/runtime/tensor.hpp"
+#include "utils.hpp"
 
 namespace ov::genai {
 
@@ -47,7 +48,7 @@ public:
         m_block_size = is_gpu ? gpu_block_size : cpu_block_size;
 
         if (is_gpu) {
-            m_context = m_request.get_compiled_model().get_context();
+            m_context = utils::singleton_core().get_default_context(m_device);
         }
         // extract information about KV cache precisions and shapes
         size_t kv_input_index = 0;
