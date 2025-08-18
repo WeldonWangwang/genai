@@ -4,20 +4,19 @@
 
 #include "visual_language/qwen2vl/classes.hpp"
 
-#include "visual_language/clip.hpp"
-
-#include "utils.hpp"
-
-#include "openvino/op/interpolate.hpp"
 #include "openvino/op/add.hpp"
-#include "openvino/op/clamp.hpp"
-#include "openvino/op/subtract.hpp"
-#include "openvino/op/multiply.hpp"
-#include "openvino/op/convert.hpp"
 #include "openvino/op/broadcast.hpp"
+#include "openvino/op/clamp.hpp"
+#include "openvino/op/convert.hpp"
+#include "openvino/op/interpolate.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/round.hpp"
+#include "openvino/op/subtract.hpp"
+#include "openvino/op/tile.hpp"
 #include "openvino/op/transpose.hpp"
+#include "utils.hpp"
+#include "visual_language/clip.hpp"
 
 namespace ov {
     class Node;
@@ -84,7 +83,7 @@ std::shared_ptr<ov::Model> patch_preprocess_into_model(std::shared_ptr<ov::Model
     ov::disable_fp16_compression(resized_images_m);
     auto resized_images_s = std::make_shared<ov::op::v1::Multiply>(resized_images_m, image_scale);
     ov::disable_fp16_compression(resized_images_s);
-    auto temporal_images = std::make_shared<ov::op::v3::Broadcast>(resized_images_s, broadcast_shape);
+    auto temporal_images = std::make_shared<ov::op::v0::Tile>(resized_images_s, broadcast_shape);
     auto reshaped_8d = std::make_shared<ov::op::v1::Reshape>(temporal_images, temp_shape8d, true);
     auto transposed_8d = std::make_shared<ov::op::v1::Transpose>(reshaped_8d, 
         std::make_shared<ov::op::v0::Constant>(ov::element::i32, Shape{8}, std::vector<int32_t>{0, 2, 5, 3, 6, 1, 4, 7})
@@ -451,9 +450,12 @@ EncodedImage VisionEncoderQwen2VL::encode(const ov::Tensor& image, const ov::Any
     size_t grid_h = target_image_size.height / config.patch_size;
     size_t grid_w = target_image_size.width / config.patch_size;
 
-    uint64_t a_broadcast_shape[4] = {
-        temporal_patch_size, channel, target_image_size.height, target_image_size.width
-    };
+    size_t repeats = 1;
+    if (patches_shape.at(0) == 1) {
+        repeats = config.temporal_patch_size;
+    }
+    uint64_t a_broadcast_shape[4] = {static_cast<size_t>(repeats), 1, 1, 1};
+
     uint64_t a_temp_shape8d[8] = {
         grid_t, temporal_patch_size * channel, grid_h / config.merge_size, config.merge_size, config.patch_size, grid_w / config.merge_size, config.merge_size, config.patch_size
     };
