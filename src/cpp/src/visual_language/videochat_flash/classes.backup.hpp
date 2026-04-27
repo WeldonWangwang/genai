@@ -37,9 +37,6 @@ protected:
     /// @brief Infer requests queue for vision merge model.
     std::unique_ptr<CircularBufferQueue<ov::InferRequest>> m_ireq_queue_merge_model;
 
-    /// @brief Infer requests queue for GPU/CPU-accelerated frame preprocessing (resize + normalize).
-    std::unique_ptr<CircularBufferQueue<ov::InferRequest>> m_ireq_queue_preprocess;
-
     /// @brief A config to follow.
     VLMConfig m_vlm_config;
 
@@ -63,9 +60,7 @@ private:
     /// @brief Initializes 3D sin-cos positional embedding tensor for vision encoder input.
     void initialize_positional_embedding();
     /// @brief Builds and prepares infer request queue for token merge model.
-    void initialize_merge_model_queue(const std::string& device, const ov::AnyMap& properties);
-    /// @brief Builds and compiles the frame preprocessing (resize + normalize) model.
-    void initialize_preprocess_queue(const std::string& device, const ov::AnyMap& properties);
+    void initialize_merge_model_queue();
     /// @brief Loads VideoChat-Flash private runtime config from model config.json.
     void initialize_runtime_config(const std::filesystem::path& config_path);
 };
