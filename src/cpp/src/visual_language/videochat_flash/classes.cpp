@@ -79,89 +79,101 @@ void write_native(std::ostream& os, size_t idx) {
  * Pipeline (all on device, batched, no per-frame CPU loop):
  *   1) Convert u8 -> f32
  *   2) Transpose NHWC -> NCHW
- *   3) Bicubic resize to (target_h, target_w) via Interpolate. Pinned to f32 with
- *      ov::disable_fp16_compression so fp16-compressing plugins (e.g. GPU) keep this
- *      single op in f32 -- see the inline comment near the Interpolate node for the
- *      numerical rationale. The other ops are linear/exact and stay at the device's
- *      default precision with no observable downstream impact.
- *   4) Clamp(0, 255) to mirror the value range of the legacy CPU uint8 staging buffer.
- *      Note: the integer round-trip (Add(0.5)+Floor) used by the legacy CPU reference
- *      path is intentionally not modelled here; with the bicubic pinned to f32 the
- *      sub-ULP residuals are absorbed by downstream LayerNorm/Softmax, matching the
- *      qwen2vl preprocess strategy.
- *   5) Normalize: (x / 255 - mean) / std, folded into
- *      (x - mean*255) * (1 / (std*255)) with broadcast constants.
+ *   3) Bicubic resize to (target_h, target_w) via a single Interpolate(CUBIC) op.
+ *      - cube_coeff = -0.5f to better approximate the legacy Pillow-like bicubic
+ *        behavior used in preprocess_cpu_loop().
+ *      - Interpolate is pinned to f32 with ov::disable_fp16_compression to avoid
+ *        fp16 grid snapping on fp16-compressing plugins (e.g. GPU), which would
+ *        otherwise introduce noticeable deviations from the CPU reference path.
+ *   4) Clamp(0, 255) to match the value range of the legacy CPU uint8 staging buffer.
+ *   5) Explicit integer round-trip to align with CPU behavior:
+ *        x = floor(x + 0.5)
+ *      This models the implicit float->uint8->float conversion in the legacy
+ *      bicubic_resize() + clip_image_preprocess() pipeline and significantly
+ *      reduces discrepancies in downstream ViT activations and LLM outputs.
+ *   6) Normalize with the same op order as clip_image_preprocess():
+ *        ((x / 255.0f) - mean[c]) / std[c]
  *
  * Inputs:
  *   - "raw_frames"    : u8  [N, H, W, 3] (dynamic N, H, W)
  *   - "resize_target" : i64 [2] = {target_h, target_w}
+ *
  * Output:
  *   - f32 [N, 3, target_h, target_w]
+ *
+ * Notes:
+ *   - Compared to the previous OV graph implementation, this version explicitly
+ *     models the integer rounding step present in the legacy CPU preprocessing path.
+ *   - Minor numerical differences may still remain because OpenVINO
+ *     Interpolate(CUBIC) is not bit-identical to the legacy Pillow-like
+ *     fixed-point bicubic implementation.
  *
  * The model is compiled once and reused across videos; the heavy per-frame
  * pixel work executes inside OpenVINO kernels instead of a C++ triple loop.
  */
-std::shared_ptr<ov::Model> build_frame_preprocess_model(
-    const std::array<float, 3>& image_mean,
-    const std::array<float, 3>& image_std) {
-    auto raw_frames = std::make_shared<ov::op::v0::Parameter>(
-        ov::element::u8, ov::PartialShape{-1, -1, -1, 3});
+std::shared_ptr<ov::Model> build_frame_preprocess_model(const std::array<float, 3>& image_mean,
+                                                        const std::array<float, 3>& image_std) {
+    auto raw_frames = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, ov::PartialShape{-1, -1, -1, 3});
     raw_frames->set_friendly_name("raw_frames");
     raw_frames->output(0).set_names({"raw_frames"});
 
-    auto resize_target = std::make_shared<ov::op::v0::Parameter>(
-        ov::element::i64, ov::PartialShape{2});
+    auto resize_target = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{2});
     resize_target->set_friendly_name("resize_target");
     resize_target->output(0).set_names({"resize_target"});
 
     // u8 NHWC -> f32 NCHW
     auto to_f32 = std::make_shared<ov::op::v0::Convert>(raw_frames, ov::element::f32);
-    auto nhwc_to_nchw = std::make_shared<ov::op::v0::Constant>(
-        ov::element::i32, ov::Shape{4}, std::vector<int32_t>{0, 3, 1, 2});
+    auto nhwc_to_nchw = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{4}, {0, 3, 1, 2});
     auto nchw = std::make_shared<ov::op::v1::Transpose>(to_f32, nhwc_to_nchw);
 
-    // Bicubic resize on spatial dims (NCHW -> axes {2, 3})
+    auto half_const = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {0.5f});
+
+    // Bicubic resize: single 2D pass, pinned to f32 to avoid GPU fp16 grid snapping.
     ov::op::v11::Interpolate::InterpolateAttrs attrs;
     attrs.mode = ov::op::v11::Interpolate::InterpolateMode::CUBIC;
     attrs.shape_calculation_mode = ov::op::v11::Interpolate::ShapeCalcMode::SIZES;
     attrs.coordinate_transformation_mode = ov::op::v11::Interpolate::CoordinateTransformMode::PYTORCH_HALF_PIXEL;
-    attrs.cube_coeff = -0.75f;
+    attrs.cube_coeff = -0.5f;
     attrs.nearest_mode = ov::op::v11::Interpolate::NearestMode::ROUND_PREFER_FLOOR;
     attrs.pads_begin = {0, 0};
     attrs.pads_end = {0, 0};
     attrs.antialias = false;
     auto resize_axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {2, 3});
-    auto resized = std::make_shared<ov::op::v11::Interpolate>(
-        nchw, resize_target, resize_axes, attrs);
-    // Pin only this op to f32 on fp16-compressing plugins (e.g. GPU). Default fp16
-    // accumulation here makes the output snap to the fp16 grid (ULP ~0.0625 in the
-    // 64..255 pixel range, e.g. 84.3125 = 84+5/16 instead of CPU's 84.3198), which
-    // perturbs downstream ViT activations and shifts LLM tokens vs the CPU baseline.
-    // The other preprocess ops (Convert/Transpose/Clamp/Subtract/Multiply) are linear
-    // or exact and stay in fp16 with no observable downstream impact.
+    auto resized = std::make_shared<ov::op::v11::Interpolate>(nchw, resize_target, resize_axes, attrs);
     ov::disable_fp16_compression(resized);
 
+    // Match legacy CPU uint8 staging:
+    // bicubic_resize() produces uint8-like pixels before clip_image_preprocess().
+    // Equivalent graph behavior:
+    //   x = clamp(x, 0, 255)
+    //   x = floor(x + 0.5)
     auto clamped = std::make_shared<ov::op::v0::Clamp>(resized, 0.0, 255.0);
 
-    // Fold (x/255 - mean)/std into (x - mean*255) * (1/(std*255)) with [1,3,1,1] broadcast consts.
-    const std::vector<float> mean_scaled{
-        image_mean[0] * 255.0f, image_mean[1] * 255.0f, image_mean[2] * 255.0f};
-    const std::vector<float> inv_std_scaled{
-        1.0f / (image_std[0] * 255.0f),
-        1.0f / (image_std[1] * 255.0f),
-        1.0f / (image_std[2] * 255.0f)};
-    auto mean_const = std::make_shared<ov::op::v0::Constant>(
-        ov::element::f32, ov::Shape{1, 3, 1, 1}, mean_scaled);
-    auto inv_std_const = std::make_shared<ov::op::v0::Constant>(
-        ov::element::f32, ov::Shape{1, 3, 1, 1}, inv_std_scaled);
-    auto centered = std::make_shared<ov::op::v1::Subtract>(clamped, mean_const);
-    auto normalized = std::make_shared<ov::op::v1::Multiply>(centered, inv_std_const);
+    auto rounded_pre = std::make_shared<ov::op::v1::Add>(clamped, half_const);
+    auto rounded = std::make_shared<ov::op::v0::Floor>(rounded_pre);
+
+    // Normalize with the same op order as clip_image_preprocess():
+    //   ((float(v2) / 255.0f) - mean[c]) / std[c]
+    auto scale_const = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {255.0f});
+    auto scaled = std::make_shared<ov::op::v1::Divide>(rounded, scale_const);
+
+    auto mean_const =
+        std::make_shared<ov::op::v0::Constant>(ov::element::f32,
+                                               ov::Shape{1, 3, 1, 1},
+                                               std::vector<float>{image_mean[0], image_mean[1], image_mean[2]});
+
+    auto std_const =
+        std::make_shared<ov::op::v0::Constant>(ov::element::f32,
+                                               ov::Shape{1, 3, 1, 1},
+                                               std::vector<float>{image_std[0], image_std[1], image_std[2]});
+
+    auto centered = std::make_shared<ov::op::v1::Subtract>(scaled, mean_const);
+    auto normalized = std::make_shared<ov::op::v1::Divide>(centered, std_const);
 
     normalized->set_friendly_name("preprocessed_frames");
-    return std::make_shared<ov::Model>(
-        ov::OutputVector{normalized},
-        ov::ParameterVector{raw_frames, resize_target},
-        "videochat_flash_frame_preprocess");
+    return std::make_shared<ov::Model>(ov::OutputVector{normalized},
+                                       ov::ParameterVector{raw_frames, resize_target},
+                                       "videochat_flash_frame_preprocess");
 }
 
 /**
