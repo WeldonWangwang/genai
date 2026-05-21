@@ -279,6 +279,14 @@ void load_arrays(gguf_ctx* ctx,
         if (tensor.type == GGUF_TYPE_Q4_0 || tensor.type == GGUF_TYPE_Q4_1 || tensor.type == GGUF_TYPE_Q8_0 ||
             tensor.type == GGUF_TYPE_Q4_K || tensor.type == GGUF_TYPE_Q6_K) {
             gguf_load_quantized(array_map, qtype_map, tensor);
+        } else if (tensor.type == GGUF_TYPE_IQ3_XXS) {
+            std::string name(tensor.name, tensor.namelen);
+            ov::Tensor loaded_array = dequantize_iq3_xxs(&tensor);
+            check_insert(array_map.emplace(name, loaded_array));
+
+            constexpr std::string_view weight_suffix = ".weight";
+            const std::string name_prefix = name.substr(0, name.length() - weight_suffix.length());
+            qtype_map.emplace(name_prefix + ".qtype", static_cast<gguf_tensor_type>(tensor.type));
         } else {
             std::string name(tensor.name, tensor.namelen);
             ov::Tensor loaded_array = extract_tensor_data(&tensor);
