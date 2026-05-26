@@ -11,6 +11,7 @@
 #include <openvino/openvino.hpp>
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
+#include "openvino/op/iq3_xxs_linear.hpp"  // from OV dev_api
 
 #include "gguf_utils/building_blocks.hpp"
 
@@ -713,7 +714,7 @@ ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
     case gguf_tensor_type::GGUF_TYPE_Q6_K:
         return make_int8_weights(key, consts, reorder, head_size, 16);
     case gguf_tensor_type::GGUF_TYPE_IQ3_XXS:
-        return make_fp16_weights(key, consts, reorder, head_size);
+        OPENVINO_THROW("IQ3_XXS should use IQ3XXSLinear path, not make_weights_subgraph");
     default:
         OPENVINO_THROW("Unsupported quantization type");
     }
@@ -726,8 +727,41 @@ ov::Output<ov::Node> make_fc(
     gguf_tensor_type qtype,
     bool reorder = false,
     int head_size = -1) {
-    auto w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size);
-    std::shared_ptr<ov::Node> output = std::make_shared<ov::op::v0::MatMul>(input, w_f32, false, true);
+
+    ov::Output<ov::Node> output;
+
+    if (qtype == gguf_tensor_type::GGUF_TYPE_IQ3_XXS && consts.count(key + ".weight.shape")) {
+        // Native compressed path: IQ3XXSLinear op
+        auto weight_blob = get_tensor(consts, key + ".weight");
+        auto compressed_const = std::make_shared<ov::op::v0::Constant>(weight_blob);
+        compressed_const->set_friendly_name(key + ".compressed_weight");
+
+        // Get logical weight shape [N, K] from stored shape tensor
+        auto shape_tensor = get_tensor(consts, key + ".weight.shape");
+        auto* shape_data = shape_tensor.data<int64_t>();
+        ov::Shape weight_shape;
+        for (size_t i = 0; i < shape_tensor.get_size(); i++) {
+            weight_shape.push_back(static_cast<size_t>(shape_data[i]));
+        }
+
+        // Ensure input is f32 for the IQ3XXSLinear op
+        auto input_f32 = input;
+        if (input.get_element_type() != ov::element::f32) {
+            input_f32 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f32);
+        }
+
+        auto iq3_linear = std::make_shared<ov::op::internal::IQ3XXSLinear>(
+            input_f32,
+            compressed_const,
+            weight_shape,
+            /*block_size=*/256,
+            /*bytes_per_block=*/98);
+        iq3_linear->set_friendly_name(key + ".iq3xxs_linear");
+        output = iq3_linear;
+    } else {
+        auto w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size);
+        output = std::make_shared<ov::op::v0::MatMul>(input, w_f32, false, true);
+    }
 
     // Add post-MatMul Add operation if exists
     if (consts.count(key + ".bias")) {
@@ -746,6 +780,30 @@ ov::Output<ov::Node> make_lm_head(
     const std::unordered_map<std::string, ov::Tensor>& consts,
     const ov::Output<ov::Node>& embeddings_node,
     gguf_tensor_type qtype) {
+
+    // IQ3_XXS native compressed path
+    if (qtype == gguf_tensor_type::GGUF_TYPE_IQ3_XXS && consts.count(key + ".weight.shape")) {
+        auto weight_blob = get_tensor(consts, key + ".weight");
+        auto compressed_const = std::make_shared<ov::op::v0::Constant>(weight_blob);
+        compressed_const->set_friendly_name(key + ".compressed_weight");
+
+        auto shape_tensor = get_tensor(consts, key + ".weight.shape");
+        auto* shape_data = shape_tensor.data<int64_t>();
+        ov::Shape weight_shape;
+        for (size_t i = 0; i < shape_tensor.get_size(); i++) {
+            weight_shape.push_back(static_cast<size_t>(shape_data[i]));
+        }
+
+        auto input_f32 = input;
+        if (input.get_element_type() != ov::element::f32) {
+            input_f32 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f32);
+        }
+
+        auto iq3_linear = std::make_shared<ov::op::internal::IQ3XXSLinear>(
+            input_f32, compressed_const, weight_shape, 256, 98);
+        iq3_linear->set_friendly_name(key + ".iq3xxs_linear");
+        return iq3_linear;
+    }
 
     ov::Output<ov::Node> w_f32;
     if (consts.count(key + ".weight")) {
