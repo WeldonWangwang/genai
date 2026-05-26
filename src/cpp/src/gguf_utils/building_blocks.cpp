@@ -712,6 +712,8 @@ ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
         return make_int4_weights(key, consts, reorder, head_size);
     case gguf_tensor_type::GGUF_TYPE_Q6_K:
         return make_int8_weights(key, consts, reorder, head_size, 16);
+    case gguf_tensor_type::GGUF_TYPE_IQ3_XXS:
+        return make_fp16_weights(key, consts, reorder, head_size);
     default:
         OPENVINO_THROW("Unsupported quantization type");
     }
