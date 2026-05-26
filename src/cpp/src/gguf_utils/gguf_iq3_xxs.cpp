@@ -23,7 +23,7 @@
 
 // The IQ3_XXS grid: 256 entries from ggml-common.h
 // Each uint32_t encodes 4 values (each byte is 2*v+1 where v is a 3-bit trit)
-static const uint32_t iq3xxs_grid[256] = {
+extern const uint32_t iq3xxs_grid[256] = {
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e,
     0x04041404, 0x04041414, 0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c,
     0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14, 0x040c140c, 0x040c142c,
@@ -71,7 +71,7 @@ static const uint32_t iq3xxs_grid[256] = {
 
 // Sign lookup table from ggml-common.h: 7-bit index -> 8-bit sign pattern (with even parity)
 // ksigns_iq2xs[i] gives the 8-bit sign pattern where bit 7 ensures even parity
-static const uint8_t ksigns_iq2xs[128] = {
+extern const uint8_t ksigns_iq2xs[128] = {
       0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
     144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
     160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
@@ -83,7 +83,7 @@ static const uint8_t ksigns_iq2xs[128] = {
 };
 
 // Mask for applying signs to each of the 8 weights in a group
-static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+extern const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
 // QK_K = 256 weights per super-block
 static constexpr int QK_K = 256;

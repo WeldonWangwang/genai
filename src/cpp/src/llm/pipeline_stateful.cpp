@@ -4,6 +4,7 @@
 
 #include "llm/pipeline_stateful.hpp"
 
+#include "gguf_utils/iq3_xxs_decompose.hpp"
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
 #include "openvino/genai/text_streamer.hpp"
@@ -59,6 +60,9 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     if (!m_is_npu) {
         utils::apply_slice_before_matmul_transformation(model);
     }
+
+    // Decompose IQ3XXSLinear ops into dequantized MatMul for CPU/GPU execution
+    ov::genai::decompose_iq3_xxs_linear(model);
 
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(model);
 
