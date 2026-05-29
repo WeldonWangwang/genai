@@ -4,6 +4,14 @@
 
 #include "openvino/op/iq3_xxs_linear.hpp"
 
+#include <cstring>
+#include <vector>
+
+// Lookup tables from gguf_iq3_xxs.cpp
+extern const uint32_t iq3xxs_grid[256];
+extern const uint8_t ksigns_iq2xs[128];
+extern const uint8_t kmask_iq2xs[8];
+
 namespace ov {
 namespace op {
 namespace internal {
@@ -86,6 +94,93 @@ std::shared_ptr<Node> IQ3XXSLinear::clone_with_new_inputs(const ov::OutputVector
                                           m_weight_shape,
                                           m_block_size,
                                           m_bytes_per_block);
+}
+
+static float fp16_to_f32(uint16_t h) {
+    uint32_t sign = (h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) { f = sign; }
+        else { exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3FF; f = sign | ((exp + 112) << 23) | (mant << 13); }
+    } else if (exp == 31) { f = sign | 0x7F800000 | (mant << 13); }
+    else { f = sign | ((exp + 112) << 23) | (mant << 13); }
+    float result; memcpy(&result, &f, 4); return result;
+}
+
+bool IQ3XXSLinear::evaluate(ov::TensorVector& outputs, const ov::TensorVector& inputs) const {
+    // activation: [..., M, K], compressed_weights: [total_bytes]
+    const auto& act_shape = inputs[0].get_shape();
+    const size_t rank = act_shape.size();
+    const size_t M = (rank >= 2) ? act_shape[rank - 2] : 1;
+    const size_t K = act_shape[rank - 1];
+    const size_t N = m_weight_shape[0];
+
+    // Compute batch dimensions
+    size_t batch = 1;
+    for (size_t i = 0; i + 2 < rank; i++) batch *= act_shape[i];
+
+    // Setup output shape
+    ov::Shape out_shape = act_shape;
+    out_shape[rank - 1] = N;
+    outputs[0].set_shape(out_shape);
+
+    const float* act_data = inputs[0].data<float>();
+    const uint8_t* compressed = inputs[1].data<uint8_t>();
+    float* out_data = outputs[0].data<float>();
+
+    constexpr size_t QK_K = 256;
+    const size_t blocks_per_row = K / QK_K;
+    const size_t bytes_per_row = blocks_per_row * 98;
+
+    // For each batch×M row, compute dot product with each of N weight rows
+    for (size_t b = 0; b < batch * M; b++) {
+        const float* a_row = act_data + b * K;
+        float* o_row = out_data + b * N;
+
+        for (size_t n = 0; n < N; n++) {
+            float acc = 0.0f;
+            const uint8_t* w_row = compressed + n * bytes_per_row;
+
+            for (size_t blk = 0; blk < blocks_per_row; blk++) {
+                const uint8_t* block_data = w_row + blk * 98;
+
+                // Decode super-block scale
+                uint16_t d_fp16;
+                memcpy(&d_fp16, block_data, 2);
+                const float d = fp16_to_f32(d_fp16);
+
+                const uint8_t* qs = block_data + 2;
+                const uint8_t* scales_and_signs = qs + QK_K / 4;  // +64
+
+                size_t w_offset = blk * QK_K;
+                for (int ib32 = 0; ib32 < 8; ++ib32) {
+                    uint32_t aux32;
+                    memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof(uint32_t));
+                    const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+
+                    for (int l = 0; l < 4; ++l) {
+                        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
+                        const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(&iq3xxs_grid[qs[2 * l + 0]]);
+                        const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(&iq3xxs_grid[qs[2 * l + 1]]);
+
+                        for (int j = 0; j < 4; ++j) {
+                            float w = db * grid1[j] * ((signs & kmask_iq2xs[j + 0]) ? -1.f : 1.f);
+                            acc += a_row[w_offset++] * w;
+                        }
+                        for (int j = 0; j < 4; ++j) {
+                            float w = db * grid2[j] * ((signs & kmask_iq2xs[j + 4]) ? -1.f : 1.f);
+                            acc += a_row[w_offset++] * w;
+                        }
+                    }
+                    qs += 8;
+                }
+            }
+            o_row[n] = acc;
+        }
+    }
+    return true;
 }
 
 }  // namespace internal
