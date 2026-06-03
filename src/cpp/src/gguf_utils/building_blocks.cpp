@@ -14,6 +14,7 @@
 #include "openvino/op/iq3_xxs_linear.hpp"  // from OV dev_api
 
 #include "gguf_utils/building_blocks.hpp"
+#include "gguf_utils/iq3_xxs_decompose.hpp"  // dequantize_iq3_xxs_blob
 
 using namespace ov;
 using namespace ov::op::v13;
@@ -701,6 +702,21 @@ ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
                                            bool reorder,
                                            int head_size) {
     switch (qtype) {
+    case gguf_tensor_type::GGUF_TYPE_F32: {
+        // F32 weights: load directly as an f32 constant (no dequantization needed).
+        auto it = consts.find(key + ".weight");
+        OPENVINO_ASSERT(it != consts.end(), "Weight not found: ", key);
+        ov::Tensor weight_f32 = it->second;
+        if (reorder) {
+            weight_f32 = reorder_interleaved_format(weight_f32, head_size);
+        }
+        auto weights_node = std::make_shared<v0::Constant>(weight_f32);
+        weights_node->set_friendly_name(key + ".weight");
+        if (weight_f32.get_element_type() != ov::element::f32) {
+            return std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f32);
+        }
+        return weights_node;
+    }
     case gguf_tensor_type::GGUF_TYPE_F16:
         return make_fp16_weights(key, consts, reorder, head_size);
     case gguf_tensor_type::GGUF_TYPE_Q8_0:
@@ -900,7 +916,25 @@ std::tuple<ov::Output<ov::Node>, ov::Output<ov::Node>> make_embedding(
     }
 
     // Create embedding weights
-    auto embed_f32 = make_weights_subgraph(key, consts, embedding_type, false, -1);
+    ov::Output<ov::Node> embed_f32;
+    if (qtype == gguf_tensor_type::GGUF_TYPE_IQ3_XXS && consts.count(key + ".weight.shape")) {
+        // IQ3_XXS embedding: dequantize the compressed blob into a real [N, K] f32
+        // constant. The embedding is a Gather (not a MatMul), so it cannot use the
+        // IQ3XXSLinear op and needs a materialized weight matrix.
+        const auto& weight_blob = consts.at(key + ".weight");
+        const auto& shape_tensor = consts.at(key + ".weight.shape");
+        const auto* shape_data = shape_tensor.data<int64_t>();
+        const int64_t N = shape_data[0];
+        const int64_t K = shape_data[1];
+        auto decompressed = ov::genai::dequantize_iq3_xxs_blob(
+            weight_blob.data<uint8_t>(), N, K);
+        embed_f32 = std::make_shared<ov::op::v0::Constant>(
+            ov::element::f32,
+            ov::Shape{static_cast<size_t>(N), static_cast<size_t>(K)},
+            decompressed.data());
+    } else {
+        embed_f32 = make_weights_subgraph(key, consts, embedding_type, false, -1);
+    }
 
     // Convert input to int32 indices
     auto input_int32 = std::make_shared<ov::op::v0::Convert>(input, ov::element::i32);

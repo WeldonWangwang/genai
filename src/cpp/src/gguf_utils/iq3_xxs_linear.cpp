@@ -4,7 +4,11 @@
 
 #include "openvino/op/iq3_xxs_linear.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 // Lookup tables from gguf_iq3_xxs.cpp
@@ -109,6 +113,46 @@ static float fp16_to_f32(uint16_t h) {
     float result; memcpy(&result, &f, 4); return result;
 }
 
+// Decode a single IQ3_XXS weight row (K values) from the compressed blob into
+// a contiguous f32 buffer. `w_row` points at the start of this row's bytes.
+// This isolates the (relatively expensive) codebook lookup so it can be done
+// once per output channel and reused across all activation rows.
+static inline void decode_iq3_xxs_row(const uint8_t* w_row, float* out, size_t blocks_per_row) {
+    constexpr size_t QK_K = 256;
+    for (size_t blk = 0; blk < blocks_per_row; blk++) {
+        const uint8_t* block_data = w_row + blk * 98;
+
+        uint16_t d_fp16;
+        memcpy(&d_fp16, block_data, 2);
+        const float d = fp16_to_f32(d_fp16);
+
+        const uint8_t* qs = block_data + 2;
+        const uint8_t* scales_and_signs = qs + QK_K / 4;  // +64
+
+        float* o = out + blk * QK_K;
+        size_t oi = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            uint32_t aux32;
+            memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
+                const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(&iq3xxs_grid[qs[2 * l + 0]]);
+                const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(&iq3xxs_grid[qs[2 * l + 1]]);
+
+                for (int j = 0; j < 4; ++j) {
+                    o[oi++] = db * grid1[j] * ((signs & kmask_iq2xs[j + 0]) ? -1.f : 1.f);
+                }
+                for (int j = 0; j < 4; ++j) {
+                    o[oi++] = db * grid2[j] * ((signs & kmask_iq2xs[j + 4]) ? -1.f : 1.f);
+                }
+            }
+            qs += 8;
+        }
+    }
+}
+
 bool IQ3XXSLinear::evaluate(ov::TensorVector& outputs, const ov::TensorVector& inputs) const {
     // activation: [..., M, K], compressed_weights: [total_bytes]
     const auto& act_shape = inputs[0].get_shape();
@@ -133,53 +177,53 @@ bool IQ3XXSLinear::evaluate(ov::TensorVector& outputs, const ov::TensorVector& i
     constexpr size_t QK_K = 256;
     const size_t blocks_per_row = K / QK_K;
     const size_t bytes_per_row = blocks_per_row * 98;
+    const size_t rows = batch * M;  // total activation rows
 
-    // For each batch×M row, compute dot product with each of N weight rows
-    for (size_t b = 0; b < batch * M; b++) {
-        const float* a_row = act_data + b * K;
-        float* o_row = out_data + b * N;
-
-        for (size_t n = 0; n < N; n++) {
-            float acc = 0.0f;
-            const uint8_t* w_row = compressed + n * bytes_per_row;
-
-            for (size_t blk = 0; blk < blocks_per_row; blk++) {
-                const uint8_t* block_data = w_row + blk * 98;
-
-                // Decode super-block scale
-                uint16_t d_fp16;
-                memcpy(&d_fp16, block_data, 2);
-                const float d = fp16_to_f32(d_fp16);
-
-                const uint8_t* qs = block_data + 2;
-                const uint8_t* scales_and_signs = qs + QK_K / 4;  // +64
-
-                size_t w_offset = blk * QK_K;
-                for (int ib32 = 0; ib32 < 8; ++ib32) {
-                    uint32_t aux32;
-                    memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof(uint32_t));
-                    const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
-
-                    for (int l = 0; l < 4; ++l) {
-                        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
-                        const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(&iq3xxs_grid[qs[2 * l + 0]]);
-                        const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(&iq3xxs_grid[qs[2 * l + 1]]);
-
-                        for (int j = 0; j < 4; ++j) {
-                            float w = db * grid1[j] * ((signs & kmask_iq2xs[j + 0]) ? -1.f : 1.f);
-                            acc += a_row[w_offset++] * w;
-                        }
-                        for (int j = 0; j < 4; ++j) {
-                            float w = db * grid2[j] * ((signs & kmask_iq2xs[j + 4]) ? -1.f : 1.f);
-                            acc += a_row[w_offset++] * w;
-                        }
-                    }
-                    qs += 8;
+    // Worker: process output channels [n_begin, n_end). For each channel, decode
+    // the weight row ONCE into a local buffer, then accumulate the dot product
+    // against every activation row. This amortizes the codebook decode over all
+    // M rows (critical for prefill) instead of re-decoding per (row, channel).
+    auto worker = [&](size_t n_begin, size_t n_end) {
+        std::vector<float> wbuf(K);
+        for (size_t n = n_begin; n < n_end; n++) {
+            decode_iq3_xxs_row(compressed + n * bytes_per_row, wbuf.data(), blocks_per_row);
+            const float* w = wbuf.data();
+            for (size_t r = 0; r < rows; r++) {
+                const float* a = act_data + r * K;
+                float acc = 0.0f;
+                // Contiguous f32 dot product; auto-vectorizes under /O2.
+                for (size_t k = 0; k < K; k++) {
+                    acc += a[k] * w[k];
                 }
+                out_data[r * N + n] = acc;
             }
-            o_row[n] = acc;
         }
+    };
+
+    // Parallelize over output channels with std::thread. Use threads only when
+    // the work is large enough to amortize spawn overhead; otherwise run serially.
+    const size_t total_work = N * rows * K;
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    size_t nthreads = static_cast<size_t>(hw);
+    constexpr size_t PARALLEL_THRESHOLD = 1ull << 20;  // ~1M MACs
+    if (total_work < PARALLEL_THRESHOLD || N < nthreads || nthreads <= 1) {
+        worker(0, N);
+        return true;
     }
+
+    std::vector<std::thread> pool;
+    pool.reserve(nthreads - 1);
+    const size_t chunk = (N + nthreads - 1) / nthreads;
+    for (size_t t = 1; t < nthreads; t++) {
+        const size_t b = t * chunk;
+        if (b >= N) break;
+        const size_t e = std::min(N, b + chunk);
+        pool.emplace_back(worker, b, e);
+    }
+    // Current thread handles the first chunk.
+    worker(0, std::min(N, chunk));
+    for (auto& th : pool) th.join();
     return true;
 }
 

@@ -45,7 +45,7 @@ static float fp16_to_fp32_local(uint16_t h) {
     return result;
 }
 
-static std::vector<float> dequantize_iq3_xxs_blob(const uint8_t* data, int64_t N, int64_t K) {
+std::vector<float> dequantize_iq3_xxs_blob(const uint8_t* data, int64_t N, int64_t K) {
     constexpr int QK_K = 256;
     constexpr int BLOCK_BYTES = 98;
     const int64_t num_blocks_per_row = K / QK_K;

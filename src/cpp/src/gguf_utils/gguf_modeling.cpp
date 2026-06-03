@@ -6,6 +6,7 @@
 #include <string>
 #include <iostream>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 
 #include <openvino/openvino.hpp>
@@ -14,6 +15,7 @@
 
 #include "gguf_utils/building_blocks.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
+#include "gguf_utils/iq3_xxs_decompose.hpp"
 #include "utils.hpp"
 
 using namespace ov;
@@ -126,6 +128,22 @@ std::shared_ptr<ov::Model> create_language_model(
     // Create model
     ov::ParameterVector inputs{input_ids, attention_mask, position_ids, beam_idx};
     auto model = std::make_shared<ov::Model>(ov::OutputVector({logits->output(0)}), sinks, inputs);
+
+    // Materialize IQ3_XXS compressed MatMuls into dequantized f32 MatMuls so the
+    // CPU plugin can run them with its optimized (multi-threaded) kernels. The
+    // native IQ3XXSLinear evaluate() path is correct but single-threaded and far
+    // too slow for a full model. This decomposition keeps numerics identical to
+    // the reference dequantization while restoring practical performance.
+    //
+    // Set OV_GENAI_IQ3XXS_NATIVE=1 to keep IQ3XXSLinear ops in the graph and use
+    // the op's own (now multi-threaded) evaluate() kernel instead of decomposing.
+    {
+        const char* native = std::getenv("OV_GENAI_IQ3XXS_NATIVE");
+        const bool keep_native = native && native[0] == '1';
+        if (!keep_native) {
+            ov::genai::decompose_iq3_xxs_linear(model);
+        }
+    }
 
     // Set runtime options
     if (std::get<int>(configs.at("file_type")) == 1 || std::get<int>(configs.at("file_type")) == 0) {

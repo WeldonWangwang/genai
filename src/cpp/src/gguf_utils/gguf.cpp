@@ -561,6 +561,11 @@ std::unordered_map<std::string, ov::Tensor> consts_from_weights(
         consts["lm_head.weight.shape"] = weights.at("output.weight.shape");
     }
 
+    // Token embedding weight shape (needed for IQ3_XXS embedding dequantization)
+    if (weights.count("token_embd.weight.shape")) {
+        consts["model.embed_tokens.weight.shape"] = weights.at("token_embd.weight.shape");
+    }
+
     return consts;
 }
 
