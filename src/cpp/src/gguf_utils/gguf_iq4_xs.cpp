@@ -26,16 +26,27 @@ static constexpr int QK_K = 256;
 static constexpr int IQ4_XS_BLOCK_BYTES = 136;
 
 static inline float fp16_to_fp32_iq4xs(uint16_t h) {
-    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-    uint32_t exp  = (h >> 10) & 0x1F;
+    const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    const uint32_t exp  = (h >> 10) & 0x1F;
     uint32_t mant = h & 0x3FF;
+    uint32_t result;
     if (exp == 0) {
-        if (mant == 0) { uint32_t r = sign; float f; memcpy(&f, &r, 4); return f; }
-        while (!(mant & 0x400)) { mant <<= 1; exp--; }
-        exp++; mant &= ~0x400;
-    } else if (exp == 31) { exp = 255; }
-    else { exp += 112; }
-    uint32_t result = sign | (exp << 23) | (mant << 13);
+        if (mant == 0) {
+            result = sign;  // +/- zero
+        } else {
+            // subnormal: normalize using a signed shift count. The previous
+            // unsigned `exp--` underflowed to 0xFFFFFFFF for tiny f16 scales,
+            // turning them into Inf/NaN and corrupting whole quant blocks.
+            int e = -1;
+            do { mant <<= 1; ++e; } while (!(mant & 0x400));
+            mant &= 0x3FF;
+            result = sign | ((uint32_t)(127 - 15 - e) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        result = sign | 0x7F800000u | (mant << 13);  // inf / nan
+    } else {
+        result = sign | ((exp + 112) << 23) | (mant << 13);  // normal
+    }
     float f; memcpy(&f, &result, 4); return f;
 }
 

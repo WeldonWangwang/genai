@@ -4,6 +4,7 @@
 #include "gguf_utils/gguf.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -358,6 +359,28 @@ void load_arrays(gguf_ctx* ctx,
             constexpr std::string_view weight_suffix = ".weight";
             const std::string name_prefix = name.substr(0, name.length() - weight_suffix.length());
             qtype_map.emplace(name_prefix + ".qtype", static_cast<gguf_tensor_type>(tensor.type));
+        } else if (tensor.type == GGUF_TYPE_Q3_K || tensor.type == GGUF_TYPE_Q5_K ||
+                   tensor.type == GGUF_TYPE_IQ3_S || tensor.type == GGUF_TYPE_IQ2_XS) {
+            // These k-/i-quant types are not supported by gguflib's gguf_tensor_to_f16
+            // and have no native compressed op yet. Dequantize them to f16 at load time
+            // and tag them as F16 so the embedding / lm_head / fc paths treat them as a
+            // plain f16 weight (no scales/biases expected).
+            std::string name(tensor.name, tensor.namelen);
+            ov::Tensor loaded_array;
+            if (tensor.type == GGUF_TYPE_Q3_K) {
+                loaded_array = dequantize_q3_k(&tensor);
+            } else if (tensor.type == GGUF_TYPE_Q5_K) {
+                loaded_array = dequantize_q5_k(&tensor);
+            } else if (tensor.type == GGUF_TYPE_IQ3_S) {
+                loaded_array = dequantize_iq3_s(&tensor);
+            } else {
+                loaded_array = dequantize_iq2_xs(&tensor);
+            }
+            check_insert(array_map.emplace(name, loaded_array));
+
+            constexpr std::string_view weight_suffix = ".weight";
+            const std::string name_prefix = name.substr(0, name.length() - weight_suffix.length());
+            qtype_map.emplace(name_prefix + ".qtype", gguf_tensor_type::GGUF_TYPE_F16);
         } else {
             std::string name(tensor.name, tensor.namelen);
             ov::Tensor loaded_array = extract_tensor_data(&tensor);

@@ -11,6 +11,8 @@
 #include <thread>
 #include <vector>
 
+#include "openvino/core/type/float16.hpp"
+
 // Lookup tables from gguf_iq3_xxs.cpp
 extern const uint32_t iq3xxs_grid[256];
 extern const uint8_t ksigns_iq2xs[128];
@@ -170,14 +172,40 @@ bool IQ3XXSLinear::evaluate(ov::TensorVector& outputs, const ov::TensorVector& i
     out_shape[rank - 1] = N;
     outputs[0].set_shape(out_shape);
 
-    const float* act_data = inputs[0].data<float>();
     const uint8_t* compressed = inputs[1].data<uint8_t>();
-    float* out_data = outputs[0].data<float>();
 
     constexpr size_t QK_K = 256;
     const size_t blocks_per_row = K / QK_K;
     const size_t bytes_per_row = blocks_per_row * 98;
     const size_t rows = batch * M;  // total activation rows
+
+    // Provide an f32 view of the activations. The CPU plugin may execute this op
+    // with f16 activations (e.g. ov::hint::inference_precision=f16, which is
+    // needed to fit large models in limited RAM). Decode/compute is done in f32
+    // for accuracy; only the (small) activation and output tensors are converted.
+    // The large compressed weights are never upcast.
+    const auto act_type = inputs[0].get_element_type();
+    std::vector<float> act_f32_storage;
+    const float* act_data = nullptr;
+    if (act_type == ov::element::f32) {
+        act_data = inputs[0].data<float>();
+    } else if (act_type == ov::element::f16) {
+        const ov::float16* a16 = inputs[0].data<ov::float16>();
+        act_f32_storage.resize(rows * K);
+        for (size_t i = 0; i < rows * K; ++i) {
+            act_f32_storage[i] = static_cast<float>(a16[i]);
+        }
+        act_data = act_f32_storage.data();
+    } else {
+        return false;
+    }
+
+    const auto out_type = outputs[0].get_element_type();
+    float* out_f32 = (out_type == ov::element::f32) ? outputs[0].data<float>() : nullptr;
+    ov::float16* out_f16 = (out_type == ov::element::f16) ? outputs[0].data<ov::float16>() : nullptr;
+    if (!out_f32 && !out_f16) {
+        return false;
+    }
 
     // Worker: process output channels [n_begin, n_end). For each channel, decode
     // the weight row ONCE into a local buffer, then accumulate the dot product
@@ -195,7 +223,11 @@ bool IQ3XXSLinear::evaluate(ov::TensorVector& outputs, const ov::TensorVector& i
                 for (size_t k = 0; k < K; k++) {
                     acc += a[k] * w[k];
                 }
-                out_data[r * N + n] = acc;
+                if (out_f32) {
+                    out_f32[r * N + n] = acc;
+                } else {
+                    out_f16[r * N + n] = ov::float16(acc);
+                }
             }
         }
     };
