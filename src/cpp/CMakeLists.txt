@@ -177,6 +177,8 @@ if(NOT ENABLE_GGUF)
     set(GGUF_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf.cpp
                      ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_quants.cpp
                      ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_iq3_xxs.cpp
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_iq2_s.cpp
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_iq4_xs.cpp
                      ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_modeling.cpp
                      ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/building_blocks.cpp
                      ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/iq3_xxs_linear.cpp

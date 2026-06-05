@@ -312,6 +312,52 @@ void load_arrays(gguf_ctx* ctx,
             constexpr std::string_view weight_suffix = ".weight";
             const std::string name_prefix = name.substr(0, name.length() - weight_suffix.length());
             qtype_map.emplace(name_prefix + ".qtype", static_cast<gguf_tensor_type>(tensor.type));
+        } else if (tensor.type == GGUF_TYPE_IQ2_S) {
+            std::string name(tensor.name, tensor.namelen);
+            // Store raw compressed bytes as u8 tensor for native compressed path
+            auto shape = get_shape(tensor);
+            const size_t K = shape.back();
+            const size_t N = (shape.size() > 1) ? shape[0] : 1;
+            const size_t blocks_per_row = K / 256;
+            const size_t total_bytes = N * blocks_per_row * 82;  // IQ2_S: 82 bytes per 256-weight block
+            ov::Tensor raw_blob(ov::element::u8, {total_bytes});
+            memcpy(raw_blob.data(), tensor.weights_data, total_bytes);
+            check_insert(array_map.emplace(name, raw_blob));
+
+            // Also store the logical shape for later use
+            ov::Tensor shape_tensor(ov::element::i64, {shape.size()});
+            auto* shape_data = shape_tensor.data<int64_t>();
+            for (size_t i = 0; i < shape.size(); i++) {
+                shape_data[i] = static_cast<int64_t>(shape[i]);
+            }
+            check_insert(array_map.emplace(name + ".shape", shape_tensor));
+
+            constexpr std::string_view weight_suffix = ".weight";
+            const std::string name_prefix = name.substr(0, name.length() - weight_suffix.length());
+            qtype_map.emplace(name_prefix + ".qtype", static_cast<gguf_tensor_type>(tensor.type));
+        } else if (tensor.type == GGUF_TYPE_IQ4_XS) {
+            std::string name(tensor.name, tensor.namelen);
+            // Store raw compressed bytes as u8 tensor for native compressed path
+            auto shape = get_shape(tensor);
+            const size_t K = shape.back();
+            const size_t N = (shape.size() > 1) ? shape[0] : 1;
+            const size_t blocks_per_row = K / 256;
+            const size_t total_bytes = N * blocks_per_row * 136;  // IQ4_XS: 136 bytes per 256-weight block
+            ov::Tensor raw_blob(ov::element::u8, {total_bytes});
+            memcpy(raw_blob.data(), tensor.weights_data, total_bytes);
+            check_insert(array_map.emplace(name, raw_blob));
+
+            // Also store the logical shape for later use
+            ov::Tensor shape_tensor(ov::element::i64, {shape.size()});
+            auto* shape_data = shape_tensor.data<int64_t>();
+            for (size_t i = 0; i < shape.size(); i++) {
+                shape_data[i] = static_cast<int64_t>(shape[i]);
+            }
+            check_insert(array_map.emplace(name + ".shape", shape_tensor));
+
+            constexpr std::string_view weight_suffix = ".weight";
+            const std::string name_prefix = name.substr(0, name.length() - weight_suffix.length());
+            qtype_map.emplace(name_prefix + ".qtype", static_cast<gguf_tensor_type>(tensor.type));
         } else {
             std::string name(tensor.name, tensor.namelen);
             ov::Tensor loaded_array = extract_tensor_data(&tensor);

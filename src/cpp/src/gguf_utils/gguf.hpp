@@ -37,6 +37,8 @@ void gguf_load_quantized(std::unordered_map<std::string, ov::Tensor>& a,
                          const gguf_tensor& tensor);
 
 ov::Tensor dequantize_iq3_xxs(gguf_tensor* tensor);
+ov::Tensor dequantize_iq2_s(gguf_tensor* tensor);
+ov::Tensor dequantize_iq4_xs(gguf_tensor* tensor);
 
 std::tuple<std::map<std::string, GGUFMetaData>,
            std::unordered_map<std::string, ov::Tensor>,
