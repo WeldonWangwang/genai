@@ -12,6 +12,7 @@
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
 #include "openvino/op/iq3_xxs_linear.hpp"  // from OV dev_api
+#include "openvino/op/util/compressed_constant.hpp"  // unified GGUF weight frontend
 
 #include "gguf_utils/building_blocks.hpp"
 #include "gguf_utils/iq3_xxs_decompose.hpp"  // dequantize_iq3_xxs_blob
@@ -751,10 +752,15 @@ ov::Output<ov::Node> make_fc(
     ov::Output<ov::Node> output;
 
     if (qtype == gguf_tensor_type::GGUF_TYPE_IQ3_XXS && consts.count(key + ".weight.shape")) {
-        // Native compressed path: IQ3XXSLinear op
+        // Unified-frontend path: build MatMul(input, CompressedConstant<IQ3_XXS>).
+        //
+        // CompressedConstant is graph-visible as a logical f32 [N, K] weight tensor, so
+        // standard OpenVINO passes (slice-before-matmul, fusion patterns, RT-info
+        // propagation, etc.) see a plain MatMul-on-Constant subgraph. The plugin-prep
+        // pass `rewrite_compressed_matmul_to_iq3_xxs_linear` in pipeline_stateful.cpp
+        // rewrites this subgraph back to IQ3XXSLinear(input_f32, raw_u8) right before
+        // compile_model, so the existing CPU native kernel is reused unchanged.
         auto weight_blob = get_tensor(consts, key + ".weight");
-        auto compressed_const = std::make_shared<ov::op::v0::Constant>(weight_blob);
-        compressed_const->set_friendly_name(key + ".compressed_weight");
 
         // Get logical weight shape [N, K] from stored shape tensor
         auto shape_tensor = get_tensor(consts, key + ".weight.shape");
@@ -764,20 +770,25 @@ ov::Output<ov::Node> make_fc(
             weight_shape.push_back(static_cast<size_t>(shape_data[i]));
         }
 
-        // Ensure input is f32 for the IQ3XXSLinear op
+        auto compressed_const = std::make_shared<ov::op::util::CompressedConstant>(
+            weight_blob,
+            weight_shape,
+            ov::element::f32,
+            ov::op::util::CompressedConstant::QuantType::IQ3_XXS);
+        compressed_const->set_friendly_name(key + ".compressed_weight");
+
+        // MatMul requires matching element types; promote input to f32 to match the
+        // CompressedConstant's logical f32 face.
         auto input_f32 = input;
         if (input.get_element_type() != ov::element::f32) {
             input_f32 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f32);
         }
 
-        auto iq3_linear = std::make_shared<ov::op::internal::IQ3XXSLinear>(
-            input_f32,
-            compressed_const,
-            weight_shape,
-            /*block_size=*/256,
-            /*bytes_per_block=*/98);
-        iq3_linear->set_friendly_name(key + ".iq3xxs_linear");
-        output = iq3_linear;
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(input_f32, compressed_const,
+                                                            /*transpose_a=*/false,
+                                                            /*transpose_b=*/true);
+        matmul->set_friendly_name(key + ".matmul");
+        output = matmul;
     } else if ((qtype == gguf_tensor_type::GGUF_TYPE_IQ2_S || qtype == gguf_tensor_type::GGUF_TYPE_IQ4_XS) &&
                consts.count(key + ".weight.shape")) {
         // Decompose-at-build path: dequantize compressed blob to f16, then normal MatMul
@@ -837,11 +848,9 @@ ov::Output<ov::Node> make_lm_head(
     const ov::Output<ov::Node>& embeddings_node,
     gguf_tensor_type qtype) {
 
-    // IQ3_XXS native compressed path
+    // IQ3_XXS unified-frontend path (same pattern as make_fc; see comments there).
     if (qtype == gguf_tensor_type::GGUF_TYPE_IQ3_XXS && consts.count(key + ".weight.shape")) {
         auto weight_blob = get_tensor(consts, key + ".weight");
-        auto compressed_const = std::make_shared<ov::op::v0::Constant>(weight_blob);
-        compressed_const->set_friendly_name(key + ".compressed_weight");
 
         auto shape_tensor = get_tensor(consts, key + ".weight.shape");
         auto* shape_data = shape_tensor.data<int64_t>();
@@ -850,15 +859,23 @@ ov::Output<ov::Node> make_lm_head(
             weight_shape.push_back(static_cast<size_t>(shape_data[i]));
         }
 
+        auto compressed_const = std::make_shared<ov::op::util::CompressedConstant>(
+            weight_blob,
+            weight_shape,
+            ov::element::f32,
+            ov::op::util::CompressedConstant::QuantType::IQ3_XXS);
+        compressed_const->set_friendly_name(key + ".compressed_weight");
+
         auto input_f32 = input;
         if (input.get_element_type() != ov::element::f32) {
             input_f32 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f32);
         }
 
-        auto iq3_linear = std::make_shared<ov::op::internal::IQ3XXSLinear>(
-            input_f32, compressed_const, weight_shape, 256, 98);
-        iq3_linear->set_friendly_name(key + ".iq3xxs_linear");
-        return iq3_linear;
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(input_f32, compressed_const,
+                                                            /*transpose_a=*/false,
+                                                            /*transpose_b=*/true);
+        matmul->set_friendly_name(key + ".matmul");
+        return matmul;
     }
 
     ov::Output<ov::Node> w_f32;

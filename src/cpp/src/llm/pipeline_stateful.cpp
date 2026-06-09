@@ -4,10 +4,15 @@
 
 #include "llm/pipeline_stateful.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
 #include "openvino/genai/text_streamer.hpp"
 
+#include "gguf_utils/compressed_constant_rewrites.hpp"
 #include "utils.hpp"
 
 namespace ov::genai {
@@ -60,9 +65,44 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         utils::apply_slice_before_matmul_transformation(model);
     }
 
-    // IQ3XXSLinear ops are NOT decomposed — they stay in the graph.
-    // The op implements evaluate() for on-the-fly dequant+matmul at runtime,
-    // keeping weights compressed in memory throughout execution.
+    // Bridge the unified GGUF compressed-weight frontend to the CPU plugin.
+    //
+    // Two routes are available; both ultimately call the SAME shared kernel
+    // ov::intel_cpu::kernels::iq3_xxs::iq3_xxs_fc, so output must be
+    // bit-exact across them:
+    //
+    //   * Route A (default):
+    //       rewrite MatMul(input, CompressedConstant<IQ3_XXS>) in-place to
+    //       IQ3XXSLinear(input_f32, raw_u8_constant). Uses the legacy CPU
+    //       plugin native op node::IQ3XXSLinear.
+    //
+    //   * Route B (opt-in, OPENVINO_GENAI_USE_COMPRESSED_CONST_FC=1):
+    //       skip the rewrite. CompressedConstant flows through
+    //       ConvertMatMulToFC and is consumed by CompressedConstantFCExecutor
+    //       inside FullyConnected.
+    //
+    // Both routes are no-ops on models without CompressedConstant nodes, so
+    // the gate is safe regardless of model content.
+    {
+        auto is_truthy = [](const char* v) -> bool {
+            if (v == nullptr) {
+                return false;
+            }
+            const std::string s(v);
+            return s == "1" || s == "true" || s == "TRUE" || s == "True" || s == "yes" || s == "on";
+        };
+        const bool use_cc_fc =
+            is_truthy(std::getenv("OPENVINO_GENAI_USE_COMPRESSED_CONST_FC"));
+        if (use_cc_fc) {
+            std::fprintf(stderr,
+                         "[openvino.genai] Route B: skipping CC->IQ3XXSLinear rewrite; "
+                         "CompressedConstant -> FullyConnected -> "
+                         "CompressedConstantFCExecutor.\n");
+            std::fflush(stderr);
+        } else {
+            ov::genai::rewrite_compressed_matmul_to_iq3_xxs_linear(model);
+        }
+    }
 
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(model);
 
