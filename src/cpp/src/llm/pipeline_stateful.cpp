@@ -148,7 +148,7 @@ StatefulLLMPipeline::StatefulLLMPipeline(
             for (const auto& n : model->get_ordered_ops()) {
                 if (std::dynamic_pointer_cast<ov::op::util::CompressedConstant>(n)) ++cc_count;
             }
-            std::fprintf(stderr, "[openvino.genai] Pre-compile CC count: %zu\n", cc_count);
+            std::fprintf(stderr, "[openvino.genai] *** ABOUT TO COMPILE *** CC count: %zu\n", cc_count);
             std::fflush(stderr);
         }
        compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
