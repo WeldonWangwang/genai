@@ -93,6 +93,11 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         };
         const bool use_cc_fc =
             is_truthy(std::getenv("OPENVINO_GENAI_USE_COMPRESSED_CONST_FC"));
+        std::fprintf(stderr,
+                     "[openvino.genai] Compressed constant handling: %s\n",
+                     use_cc_fc ? "Route B (CompressedConstantFCExecutor)"
+                               : "Route A (IQ3XXSLinear rewrite)");
+        std::fflush(stderr);
         if (use_cc_fc) {
             std::fprintf(stderr,
                          "[openvino.genai] Route B: skipping CC->IQ3XXSLinear rewrite; "
