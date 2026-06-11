@@ -12,6 +12,7 @@
 
 #include "llm/pipeline_stateful.hpp"
 #include "llm/pipeline_continuous_batching_adapter.hpp"
+#include "gguf_utils/compressed_constant_rewrites.hpp"
 #include "speculative_decoding/eagle3_model_transforms.hpp"
 #include "speculative_decoding/stateful/eagle3_strategy.hpp"
 #include "speculative_decoding/stateful/fast_draft_strategy.hpp"
@@ -260,6 +261,22 @@ ov::genai::LLMPipeline::LLMPipeline(
     // Read model and create tokenizer once to avoid double I/O during pipeline construction.
     std::shared_ptr<ov::Model> model = utils::read_model(models_path, properties);
     const Tokenizer tokenizer(models_path, properties);
+
+    // Apply CompressedConstant → IQ3XXSLinear rewrite EARLY, before any backend
+    // (ContinuousBatching / Stateful) attempts to compile the model. This prevents
+    // OOM crashes from the pin pass trying to wrap all CC nodes in a model that
+    // hasn't been rewritten yet. The env var gate is checked here; if Route B is
+    // selected, no rewrite is applied and CC flows through to the FC executor.
+    {
+        auto is_truthy = [](const char* v) -> bool {
+            if (!v) return false;
+            std::string s(v);
+            return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "on";
+        };
+        if (!is_truthy(std::getenv("OPENVINO_GENAI_USE_COMPRESSED_CONST_FC"))) {
+            ov::genai::rewrite_compressed_matmul_to_iq3_xxs_linear(model);
+        }
+    }
 
     const auto generation_config = utils::from_config_json_if_exists(models_path);
     if (is_npu_requested) {

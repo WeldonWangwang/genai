@@ -11,8 +11,11 @@
 #include <openvino/openvino.hpp>
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
+#include "openvino/op/iq3_xxs_linear.hpp"  // from OV dev_api
+#include "openvino/op/util/compressed_constant.hpp"  // unified GGUF weight frontend
 
 #include "gguf_utils/building_blocks.hpp"
+#include "gguf_utils/iq3_xxs_decompose.hpp"  // dequantize_iq3_xxs_blob
 
 using namespace ov;
 using namespace ov::op::v13;
@@ -700,6 +703,21 @@ ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
                                            bool reorder,
                                            int head_size) {
     switch (qtype) {
+    case gguf_tensor_type::GGUF_TYPE_F32: {
+        // F32 weights: load directly as an f32 constant (no dequantization needed).
+        auto it = consts.find(key + ".weight");
+        OPENVINO_ASSERT(it != consts.end(), "Weight not found: ", key);
+        ov::Tensor weight_f32 = it->second;
+        if (reorder) {
+            weight_f32 = reorder_interleaved_format(weight_f32, head_size);
+        }
+        auto weights_node = std::make_shared<v0::Constant>(weight_f32);
+        weights_node->set_friendly_name(key + ".weight");
+        if (weight_f32.get_element_type() != ov::element::f32) {
+            return std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f32);
+        }
+        return weights_node;
+    }
     case gguf_tensor_type::GGUF_TYPE_F16:
         return make_fp16_weights(key, consts, reorder, head_size);
     case gguf_tensor_type::GGUF_TYPE_Q8_0:
@@ -712,8 +730,14 @@ ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
         return make_int4_weights(key, consts, reorder, head_size);
     case gguf_tensor_type::GGUF_TYPE_Q6_K:
         return make_int8_weights(key, consts, reorder, head_size, 16);
+    case gguf_tensor_type::GGUF_TYPE_IQ2_S:
+        OPENVINO_THROW("IQ2_S should use decompose path in make_fc, not make_weights_subgraph");
+    case gguf_tensor_type::GGUF_TYPE_IQ4_XS:
+        OPENVINO_THROW("IQ4_XS should use decompose path in make_fc, not make_weights_subgraph");
+    case gguf_tensor_type::GGUF_TYPE_IQ3_XXS:
+        OPENVINO_THROW("IQ3_XXS should use IQ3XXSLinear path, not make_weights_subgraph");
     default:
-        OPENVINO_THROW("Unsupported quantization type");
+        OPENVINO_THROW("Unsupported quantization type: ", static_cast<int>(qtype));
     }
 }
 
@@ -724,8 +748,87 @@ ov::Output<ov::Node> make_fc(
     gguf_tensor_type qtype,
     bool reorder = false,
     int head_size = -1) {
-    auto w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size);
-    std::shared_ptr<ov::Node> output = std::make_shared<ov::op::v0::MatMul>(input, w_f32, false, true);
+
+    ov::Output<ov::Node> output;
+
+    if (qtype == gguf_tensor_type::GGUF_TYPE_IQ3_XXS && consts.count(key + ".weight.shape")) {
+        // Unified-frontend path: build MatMul(input, CompressedConstant<IQ3_XXS>).
+        //
+        // CompressedConstant is graph-visible as a logical f32 [N, K] weight tensor, so
+        // standard OpenVINO passes (slice-before-matmul, fusion patterns, RT-info
+        // propagation, etc.) see a plain MatMul-on-Constant subgraph. The plugin-prep
+        // pass `rewrite_compressed_matmul_to_iq3_xxs_linear` in pipeline_stateful.cpp
+        // rewrites this subgraph back to IQ3XXSLinear(input_f32, raw_u8) right before
+        // compile_model, so the existing CPU native kernel is reused unchanged.
+        auto weight_blob = get_tensor(consts, key + ".weight");
+
+        // Get logical weight shape [N, K] from stored shape tensor
+        auto shape_tensor = get_tensor(consts, key + ".weight.shape");
+        auto* shape_data = shape_tensor.data<int64_t>();
+        ov::Shape weight_shape;
+        for (size_t i = 0; i < shape_tensor.get_size(); i++) {
+            weight_shape.push_back(static_cast<size_t>(shape_data[i]));
+        }
+
+        auto compressed_const = std::make_shared<ov::op::util::CompressedConstant>(
+            weight_blob,
+            weight_shape,
+            ov::element::f32,
+            ov::op::util::CompressedConstant::QuantType::IQ3_XXS);
+        compressed_const->set_friendly_name(key + ".compressed_weight");
+
+        // MatMul requires matching element types; promote input to f32 to match the
+        // CompressedConstant's logical f32 face.
+        auto input_f32 = input;
+        if (input.get_element_type() != ov::element::f32) {
+            input_f32 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f32);
+        }
+
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(input_f32, compressed_const,
+                                                            /*transpose_a=*/false,
+                                                            /*transpose_b=*/true);
+        matmul->set_friendly_name(key + ".matmul");
+        output = matmul;
+    } else if ((qtype == gguf_tensor_type::GGUF_TYPE_IQ2_S || qtype == gguf_tensor_type::GGUF_TYPE_IQ4_XS) &&
+               consts.count(key + ".weight.shape")) {
+        // Decompose-at-build path: dequantize compressed blob to f16, then normal MatMul
+        auto weight_blob = get_tensor(consts, key + ".weight");
+        auto shape_tensor = get_tensor(consts, key + ".weight.shape");
+        auto* shape_data = shape_tensor.data<int64_t>();
+        ov::Shape weight_shape;
+        for (size_t i = 0; i < shape_tensor.get_size(); i++) {
+            weight_shape.push_back(static_cast<size_t>(shape_data[i]));
+        }
+
+        // Build a temporary gguf_tensor to pass to the dequantizer
+        gguf_tensor tmp_tensor;
+        tmp_tensor.type = (qtype == gguf_tensor_type::GGUF_TYPE_IQ2_S) ? GGUF_TYPE_IQ2_S : GGUF_TYPE_IQ4_XS;
+        tmp_tensor.weights_data = weight_blob.data<uint8_t>();
+        tmp_tensor.bsize = weight_blob.get_byte_size();
+        tmp_tensor.ndim = static_cast<uint32_t>(weight_shape.size());
+        // Note: gguf_tensor dim is in reverse order (row-major vs col-major)
+        for (size_t i = 0; i < weight_shape.size(); i++) {
+            tmp_tensor.dim[i] = static_cast<uint64_t>(weight_shape[weight_shape.size() - 1 - i]);
+        }
+        uint64_t num_w = 1;
+        for (auto d : weight_shape) num_w *= d;
+        tmp_tensor.num_weights = num_w;
+
+        ov::Tensor weight_f16;
+        if (qtype == gguf_tensor_type::GGUF_TYPE_IQ2_S) {
+            weight_f16 = dequantize_iq2_s(&tmp_tensor);
+        } else {
+            weight_f16 = dequantize_iq4_xs(&tmp_tensor);
+        }
+
+        auto weights_const = std::make_shared<ov::op::v0::Constant>(weight_f16);
+        weights_const->set_friendly_name(key + ".weight");
+        auto w_f32 = std::make_shared<ov::op::v0::Convert>(weights_const, ov::element::f32);
+        output = std::make_shared<ov::op::v0::MatMul>(input, w_f32, false, true);
+    } else {
+        auto w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size);
+        output = std::make_shared<ov::op::v0::MatMul>(input, w_f32, false, true);
+    }
 
     // Add post-MatMul Add operation if exists
     if (consts.count(key + ".bias")) {
@@ -744,6 +847,36 @@ ov::Output<ov::Node> make_lm_head(
     const std::unordered_map<std::string, ov::Tensor>& consts,
     const ov::Output<ov::Node>& embeddings_node,
     gguf_tensor_type qtype) {
+
+    // IQ3_XXS unified-frontend path (same pattern as make_fc; see comments there).
+    if (qtype == gguf_tensor_type::GGUF_TYPE_IQ3_XXS && consts.count(key + ".weight.shape")) {
+        auto weight_blob = get_tensor(consts, key + ".weight");
+
+        auto shape_tensor = get_tensor(consts, key + ".weight.shape");
+        auto* shape_data = shape_tensor.data<int64_t>();
+        ov::Shape weight_shape;
+        for (size_t i = 0; i < shape_tensor.get_size(); i++) {
+            weight_shape.push_back(static_cast<size_t>(shape_data[i]));
+        }
+
+        auto compressed_const = std::make_shared<ov::op::util::CompressedConstant>(
+            weight_blob,
+            weight_shape,
+            ov::element::f32,
+            ov::op::util::CompressedConstant::QuantType::IQ3_XXS);
+        compressed_const->set_friendly_name(key + ".compressed_weight");
+
+        auto input_f32 = input;
+        if (input.get_element_type() != ov::element::f32) {
+            input_f32 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f32);
+        }
+
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(input_f32, compressed_const,
+                                                            /*transpose_a=*/false,
+                                                            /*transpose_b=*/true);
+        matmul->set_friendly_name(key + ".matmul");
+        return matmul;
+    }
 
     ov::Output<ov::Node> w_f32;
     if (consts.count(key + ".weight")) {
@@ -840,7 +973,25 @@ std::tuple<ov::Output<ov::Node>, ov::Output<ov::Node>> make_embedding(
     }
 
     // Create embedding weights
-    auto embed_f32 = make_weights_subgraph(key, consts, embedding_type, false, -1);
+    ov::Output<ov::Node> embed_f32;
+    if (qtype == gguf_tensor_type::GGUF_TYPE_IQ3_XXS && consts.count(key + ".weight.shape")) {
+        // IQ3_XXS embedding: dequantize the compressed blob into a real [N, K] f32
+        // constant. The embedding is a Gather (not a MatMul), so it cannot use the
+        // IQ3XXSLinear op and needs a materialized weight matrix.
+        const auto& weight_blob = consts.at(key + ".weight");
+        const auto& shape_tensor = consts.at(key + ".weight.shape");
+        const auto* shape_data = shape_tensor.data<int64_t>();
+        const int64_t N = shape_data[0];
+        const int64_t K = shape_data[1];
+        auto decompressed = ov::genai::dequantize_iq3_xxs_blob(
+            weight_blob.data<uint8_t>(), N, K);
+        embed_f32 = std::make_shared<ov::op::v0::Constant>(
+            ov::element::f32,
+            ov::Shape{static_cast<size_t>(N), static_cast<size_t>(K)},
+            decompressed.data());
+    } else {
+        embed_f32 = make_weights_subgraph(key, consts, embedding_type, false, -1);
+    }
 
     // Convert input to int32 indices
     auto input_int32 = std::make_shared<ov::op::v0::Convert>(input, ov::element::i32);

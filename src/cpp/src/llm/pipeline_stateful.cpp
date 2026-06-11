@@ -4,10 +4,16 @@
 
 #include "llm/pipeline_stateful.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
 #include "openvino/genai/text_streamer.hpp"
 
+#include "gguf_utils/compressed_constant_rewrites.hpp"
+#include "openvino/op/util/compressed_constant.hpp"
 #include "utils.hpp"
 
 namespace ov::genai {
@@ -60,6 +66,64 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         utils::apply_slice_before_matmul_transformation(model);
     }
 
+    // Bridge the unified GGUF compressed-weight frontend to the CPU plugin.
+    //
+    // Two routes are available; both ultimately call the SAME shared kernel
+    // ov::intel_cpu::kernels::iq3_xxs::iq3_xxs_fc, so output must be
+    // bit-exact across them:
+    //
+    //   * Route A (default):
+    //       rewrite MatMul(input, CompressedConstant<IQ3_XXS>) in-place to
+    //       IQ3XXSLinear(input_f32, raw_u8_constant). Uses the legacy CPU
+    //       plugin native op node::IQ3XXSLinear.
+    //
+    //   * Route B (opt-in, OPENVINO_GENAI_USE_COMPRESSED_CONST_FC=1):
+    //       skip the rewrite. CompressedConstant flows through
+    //       ConvertMatMulToFC and is consumed by CompressedConstantFCExecutor
+    //       inside FullyConnected.
+    //
+    // Both routes are no-ops on models without CompressedConstant nodes, so
+    // the gate is safe regardless of model content.
+    {
+        auto is_truthy = [](const char* v) -> bool {
+            if (v == nullptr) {
+                return false;
+            }
+            const std::string s(v);
+            return s == "1" || s == "true" || s == "TRUE" || s == "True" || s == "yes" || s == "on";
+        };
+        const bool use_cc_fc =
+            is_truthy(std::getenv("OPENVINO_GENAI_USE_COMPRESSED_CONST_FC"));
+        std::fprintf(stderr,
+                     "[openvino.genai] Compressed constant handling: %s\n",
+                     use_cc_fc ? "Route B (CompressedConstantFCExecutor)"
+                               : "Route A (IQ3XXSLinear rewrite)");
+        std::fflush(stderr);
+        if (use_cc_fc) {
+            std::fprintf(stderr,
+                         "[openvino.genai] Route B: skipping CC->IQ3XXSLinear rewrite; "
+                         "CompressedConstant -> FullyConnected -> "
+                         "CompressedConstantFCExecutor.\n");
+            std::fflush(stderr);
+        } else {
+            // Count CC nodes before rewrite.
+            size_t cc_before = 0;
+            for (const auto& n : model->get_ordered_ops()) {
+                if (std::dynamic_pointer_cast<ov::op::util::CompressedConstant>(n)) ++cc_before;
+            }
+            bool changed = ov::genai::rewrite_compressed_matmul_to_iq3_xxs_linear(model);
+            size_t cc_after = 0;
+            for (const auto& n : model->get_ordered_ops()) {
+                if (std::dynamic_pointer_cast<ov::op::util::CompressedConstant>(n)) ++cc_after;
+            }
+            std::fprintf(stderr,
+                         "[openvino.genai] Route A rewrite: modified=%d, "
+                         "CC before=%zu, CC after=%zu\n",
+                         (int)changed, cc_before, cc_after);
+            std::fflush(stderr);
+        }
+    }
+
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(model);
 
     if (!m_use_full_chat_history)
@@ -78,6 +142,15 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         m_max_prompt_len = kv_desc.max_prompt_len;
         m_max_kv_cache_size = kv_desc.max_prompt_len + kv_desc.min_response_len;
     } else {
+        // Diagnostic: verify CC count right before compile_model
+        {
+            size_t cc_count = 0;
+            for (const auto& n : model->get_ordered_ops()) {
+                if (std::dynamic_pointer_cast<ov::op::util::CompressedConstant>(n)) ++cc_count;
+            }
+            std::fprintf(stderr, "[openvino.genai] *** ABOUT TO COMPILE *** CC count: %zu\n", cc_count);
+            std::fflush(stderr);
+        }
        compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
     }
     m_model_runner = compiled_model.create_infer_request();
