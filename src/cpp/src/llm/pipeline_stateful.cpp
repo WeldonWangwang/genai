@@ -13,6 +13,7 @@
 #include "openvino/genai/text_streamer.hpp"
 
 #include "gguf_utils/compressed_constant_rewrites.hpp"
+#include "openvino/op/util/compressed_constant.hpp"
 #include "utils.hpp"
 
 namespace ov::genai {
@@ -105,7 +106,21 @@ StatefulLLMPipeline::StatefulLLMPipeline(
                          "CompressedConstantFCExecutor.\n");
             std::fflush(stderr);
         } else {
-            ov::genai::rewrite_compressed_matmul_to_iq3_xxs_linear(model);
+            // Count CC nodes before rewrite.
+            size_t cc_before = 0;
+            for (const auto& n : model->get_ordered_ops()) {
+                if (std::dynamic_pointer_cast<ov::op::util::CompressedConstant>(n)) ++cc_before;
+            }
+            bool changed = ov::genai::rewrite_compressed_matmul_to_iq3_xxs_linear(model);
+            size_t cc_after = 0;
+            for (const auto& n : model->get_ordered_ops()) {
+                if (std::dynamic_pointer_cast<ov::op::util::CompressedConstant>(n)) ++cc_after;
+            }
+            std::fprintf(stderr,
+                         "[openvino.genai] Route A rewrite: modified=%d, "
+                         "CC before=%zu, CC after=%zu\n",
+                         (int)changed, cc_before, cc_after);
+            std::fflush(stderr);
         }
     }
 
@@ -127,6 +142,15 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         m_max_prompt_len = kv_desc.max_prompt_len;
         m_max_kv_cache_size = kv_desc.max_prompt_len + kv_desc.min_response_len;
     } else {
+        // Diagnostic: verify CC count right before compile_model
+        {
+            size_t cc_count = 0;
+            for (const auto& n : model->get_ordered_ops()) {
+                if (std::dynamic_pointer_cast<ov::op::util::CompressedConstant>(n)) ++cc_count;
+            }
+            std::fprintf(stderr, "[openvino.genai] Pre-compile CC count: %zu\n", cc_count);
+            std::fflush(stderr);
+        }
        compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
     }
     m_model_runner = compiled_model.create_infer_request();
