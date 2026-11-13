@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 
 #include "openvino/genai/generation_config.hpp"
 #include "sampling/logit_transformers.hpp"
@@ -20,16 +19,6 @@ protected:
     std::shared_ptr<std::map<int64_t, size_t>> m_unique_generated_token_ids = std::shared_ptr<std::map<int64_t, size_t>>(new std::map<int64_t, size_t>);
     std::shared_ptr<std::set<int64_t>> m_unique_prompt_token_ids = std::shared_ptr<std::set<int64_t>>(new std::set<int64_t>);
     size_t m_generated_tokens = 0;
-    size_t m_presence_penalty_window = 0;
-    std::vector<int64_t> m_presence_history;
-    std::shared_ptr<std::map<int64_t, size_t>> m_presence_window_counts = std::make_shared<std::map<int64_t, size_t>>();
-
-    static size_t experimental_presence_window() {
-        const char* setting = std::getenv("OV_GENAI_EXPERIMENTAL_PRESENCE_WINDOW64");
-        OPENVINO_ASSERT(setting == nullptr || std::string(setting) == "0" || std::string(setting) == "1",
-                        "OV_GENAI_EXPERIMENTAL_PRESENCE_WINDOW64 must be 0 or 1");
-        return setting != nullptr && std::string(setting) == "1" ? 64 : 0;
-    }
 
     // speculative decoding parameters
     float m_assistant_confidence_threshold = 0.f;
@@ -38,9 +27,8 @@ protected:
 public:
     LogitProcessor(const ov::genai::GenerationConfig& sampling_params,
                    const LogitTransformers::TokenIds& input_ids,
-                   std::shared_ptr<ov::genai::StructuredOutputController> structured_output_controller = nullptr,
-                   size_t presence_penalty_window = experimental_presence_window()
-    ) : m_presence_penalty_window(presence_penalty_window) {
+                   std::shared_ptr<ov::genai::StructuredOutputController> structured_output_controller = nullptr
+    ) {
         for (const auto& input_id : input_ids) {
             m_unique_prompt_token_ids->insert(input_id);
         }
@@ -77,9 +65,7 @@ public:
             }
             if (sampling_params.presence_penalty != 0.0f) {
                 auto transformer = std::make_shared<LogitTransformers::PresencePenaltyTransform>(sampling_params.presence_penalty);
-                transformer->set_unique_generated_token_ids(m_presence_penalty_window > 0
-                                                               ? m_presence_window_counts
-                                                               : m_unique_generated_token_ids);
+                transformer->set_unique_generated_token_ids(m_unique_generated_token_ids);
                 m_logit_transformers.push_back(transformer);
             }
             if (sampling_params.frequency_penalty != 0.0f) {
@@ -130,15 +116,6 @@ public:
     }
 
     void apply(Logits& logits) {
-        if (m_presence_penalty_window > 0) {
-            m_presence_window_counts->clear();
-            const size_t first_token = m_presence_history.size() > m_presence_penalty_window
-                                           ? m_presence_history.size() - m_presence_penalty_window
-                                           : 0;
-            for (size_t position = first_token; position < m_presence_history.size(); ++position) {
-                ++(*m_presence_window_counts)[m_presence_history[position]];
-            }
-        }
         for (const auto& transformer : m_logit_transformers) {
             if (transformer->is_applicable(m_generated_tokens)) {
                 transformer->apply(logits);
@@ -155,9 +132,6 @@ public:
     }
 
     void register_new_generated_token(int64_t new_token_id) {
-        if (m_presence_penalty_window > 0) {
-            m_presence_history.push_back(new_token_id);
-        }
         auto it = m_unique_generated_token_ids->find(new_token_id);
         if (it == m_unique_generated_token_ids->end()) {
             m_unique_generated_token_ids->insert({new_token_id, 1});
@@ -173,11 +147,6 @@ public:
 
     void decrease_generated_token_occurance(int64_t token_id) {
         OPENVINO_ASSERT(m_unique_generated_token_ids->count(token_id) > 0);
-        if (m_presence_penalty_window > 0) {
-            OPENVINO_ASSERT(!m_presence_history.empty() && m_presence_history.back() == token_id,
-                            "Experimental presence-window rollback must remove the most recent generated token");
-            m_presence_history.pop_back();
-        }
         m_unique_generated_token_ids->at(token_id)--;
     }
 

@@ -127,61 +127,6 @@ ov::Tensor make_logits(size_t num_tokens) {
 
 }  // namespace
 
-TEST(PresencePenaltyWindowTest, expires_after_64_generated_tokens_and_restores_on_rollback) {
-    GenerationConfig config;
-    config.presence_penalty = 1.5f;
-    LogitProcessor windowed(config, {2}, nullptr, 64);
-    LogitProcessor unlimited(config, {2}, nullptr, 0);
-    windowed.register_new_generated_token(0);
-    unlimited.register_new_generated_token(0);
-    for (size_t position = 0; position < 63; ++position) {
-        windowed.register_new_generated_token(1);
-        unlimited.register_new_generated_token(1);
-    }
-    std::vector<float> boundary_values(3, 4.0f);
-    Logits boundary_logits(boundary_values.data(), boundary_values.size());
-    windowed.apply(boundary_logits);
-    EXPECT_FLOAT_EQ(boundary_values[0], 2.5f);
-    EXPECT_FLOAT_EQ(boundary_values[1], 2.5f);
-    EXPECT_FLOAT_EQ(boundary_values[2], 4.0f);
-
-    windowed.register_new_generated_token(1);
-    unlimited.register_new_generated_token(1);
-    std::vector<float> window_values(3, 4.0f);
-    std::vector<float> unlimited_values(3, 4.0f);
-    Logits window_logits(window_values.data(), window_values.size());
-    Logits unlimited_logits(unlimited_values.data(), unlimited_values.size());
-    windowed.apply(window_logits);
-    unlimited.apply(unlimited_logits);
-    EXPECT_FLOAT_EQ(window_values[0], 4.0f);
-    EXPECT_FLOAT_EQ(unlimited_values[0], 2.5f);
-    EXPECT_FLOAT_EQ(window_values[1], 2.5f);
-
-    windowed.decrease_generated_token_occurance(1);
-    std::vector<float> rollback_values(3, 4.0f);
-    Logits rollback_logits(rollback_values.data(), rollback_values.size());
-    windowed.apply(rollback_logits);
-    EXPECT_FLOAT_EQ(rollback_values[0], 2.5f);
-    EXPECT_FLOAT_EQ(rollback_values[1], 2.5f);
-}
-
-TEST(PresencePenaltyWindowTest, retains_recent_duplicates_and_preserves_frequency_history) {
-    GenerationConfig config;
-    config.presence_penalty = 1.5f;
-    config.frequency_penalty = 0.25f;
-    LogitProcessor processor(config, {2}, nullptr, 64);
-    processor.register_new_generated_token(0);
-    for (size_t position = 0; position < 63; ++position) {
-        processor.register_new_generated_token(1);
-    }
-    processor.register_new_generated_token(0);
-    std::vector<float> values(3, 4.0f);
-    Logits logits(values.data(), values.size());
-    processor.apply(logits);
-    EXPECT_FLOAT_EQ(values[0], 2.0f);
-    EXPECT_FLOAT_EQ(values[2], 4.0f);
-}
-
 TEST(SamplerWorkerJoiningTest, waits_for_blocked_worker_and_preserves_worker_exception) {
     SequenceGroup::Ptr failing_group = make_scheduled_group(0);
     SequenceGroup::Ptr blocked_group = make_scheduled_group(1);
